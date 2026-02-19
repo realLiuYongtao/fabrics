@@ -8,3 +8,7 @@ CNN是原始版本'CNN.py'，后改进为多通道Inception模块'I.py'
 后来加入了三种注意力机制'Att.py'，并验证了通道自注意力机制最有效
 
 <img width="1413" height="585" alt="image" src="https://github.com/user-attachments/assets/158801fe-d903-46b2-89f4-f5791042a3db" />
+
+在自建数据集上达到目前业界顶尖水平
+
+<img width="1014" height="479" alt="image" src="https://github.com/user-attachments/assets/20bd5c5e-e103-45d7-a939-2d8198626482" />
