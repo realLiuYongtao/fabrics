@@ -1,0 +1,368 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+
+class ChannelAttention(nn.Module):
+    def __init__(self, channels, reduction_ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.max_pool = nn.AdaptiveMaxPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction_ratio),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction_ratio, channels)
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x).squeeze(-1)).unsqueeze(-1)
+        max_out = self.fc(self.max_pool(x).squeeze(-1)).unsqueeze(-1)
+        out = avg_out + max_out
+        return x * self.sigmoid(out)
+
+
+class Inception(nn.Module):
+    def __init__(self, in_channels, out_ch1x1, out_ch3x3r, out_ch3x3, out_ch5x5r, out_ch5x5, pool_proj):
+        super(Inception, self).__init__()
+        self.batch1 = torch.nn.Sequential(
+            torch.nn.Conv1d(in_channels, out_ch1x1, 1),
+            torch.nn.ReLU(inplace=True)
+        )
+        self.batch2 = torch.nn.Sequential(
+            torch.nn.Conv1d(in_channels, out_ch3x3r, 1),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Conv1d(out_ch3x3r, out_ch3x3, 3, 1, 1),
+            torch.nn.ReLU(inplace=True)
+        )
+        self.batch3 = torch.nn.Sequential(
+            torch.nn.Conv1d(in_channels, out_ch5x5r, 1),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Conv1d(out_ch5x5r, out_ch5x5, 5, 1, 2),
+            torch.nn.ReLU(inplace=True)
+        )
+        self.batch4 = torch.nn.Sequential(
+            torch.nn.MaxPool1d(3, 1, 1),
+            torch.nn.Conv1d(in_channels, pool_proj, 1),
+            torch.nn.ReLU(inplace=True)
+        )
+        # 添加通道注意力机制
+        self.ca1 = ChannelAttention(out_ch1x1)
+        self.ca2 = ChannelAttention(out_ch3x3)
+        self.ca3 = ChannelAttention(out_ch5x5)
+        self.ca4 = ChannelAttention(pool_proj)
+
+    def forward(self, x):
+        b1 = self.ca1(self.batch1(x))
+        b2 = self.ca2(self.batch2(x))
+        b3 = self.ca3(self.batch3(x))
+        b4 = self.ca4(self.batch4(x))
+
+        output = [b1, b2, b3, b4]  # batch (out_ch1x1+out_ch3x3+out_ch5x5+pool_proj)
+
+        return torch.cat(output, 1)
+
+
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv1d(1, 16, 7, 2)
+        self.bn1 = nn.BatchNorm1d(16)
+        self.conv2 = nn.Conv1d(16, 32, 1, 1)
+        self.bn2 = nn.BatchNorm1d(32)
+        self.conv3 = nn.Conv1d(32, 64, 3, 2)
+        self.bn3 = nn.BatchNorm1d(64)
+        self.pool = nn.MaxPool1d(3, 2)
+        self.inception1a = Inception(64, 16, 16, 32, 16, 32, 16)
+        self.bn4 = nn.BatchNorm1d(96)
+        self.inception1b = Inception(96, 32, 16, 32, 16, 32, 16)
+        self.bn5 = nn.BatchNorm1d(112)
+        self.inception1c = Inception(112, 32, 32, 32, 32, 32, 32)
+        self.bn6 = nn.BatchNorm1d(128)
+        self.inception2a = Inception(128, 32, 32, 16, 32, 16, 16)
+        self.inception2b = Inception(80, 16, 16, 16, 16, 16, 16)
+
+        self.conv4 = nn.Conv1d(64, 32, 1)  # 1x1 convolution to reduce channels
+        self.bn7 = nn.BatchNorm1d(32)
+        self.conv5 = nn.Conv1d(32, 3, 1)  # 1x1 convolution to get final output
+
+        self.dropout1 = nn.Dropout(p=0.5)
+        self.dropout2 = nn.Dropout(p=0.5)
+
+        self.sigmoid = nn.Sigmoid()
+
+        # Kaiming权重初始化
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        x = self.conv1(x)  # 157*16
+        x = self.bn1(x)
+        x = torch.relu(x)
+        x = self.pool(x)  # 78*16
+        x = self.conv2(x)  # 78*32
+        x = self.bn2(x)
+        x = torch.relu(x)
+        x = self.conv3(x)  # 38*64
+        x = self.bn3(x)
+        x = torch.relu(x)
+        x = self.pool(x)  # 18*64
+        x = self.inception1a.forward(x)  # 18*96
+        x = self.bn4(x)
+        x = self.inception1b.forward(x)  # 18*112
+        x = self.bn5(x)
+        x = self.inception1c.forward(x)  # 18*128
+        x = self.bn6(x)
+        x = self.inception2a.forward(x)  # 18*112
+        x = self.inception2b.forward(x)  # 18*64
+        x = torch.relu(self.conv4(x))  # 18*32
+        x = self.conv5(x)  # 18*3
+        x = torch.mean(x, dim=2, keepdim=False)  # 去掉多余的维度
+        x = self.sigmoid(x)  # 0-1之间
+        return x
+
+
+# 加载.pt文件
+data_dict = torch.load('dataset_split.pt')
+
+# 取出训练集和测试集
+X_train = data_dict['X_train']  # 训练集特征
+y_train = data_dict['y_train']  # 训练集标签
+X_test = data_dict['X_test']    # 测试集特征
+y_test = data_dict['y_test']    # 测试集标签
+
+# 打印形状验证
+print("训练集特征:", X_train.shape)
+print("训练集标签:", y_train.shape)
+print("测试集特征:", X_test.shape)
+print("测试集标签:", y_test.shape)
+
+X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+
+y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
+y_test_tensor = torch.tensor(y_test, dtype=torch.float32)
+
+# 创建 DataLoader
+train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+
+batch_size = 16
+learning_rate = 0.001
+num_epochs = 1000
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+# 实例化模型
+model = Net()
+
+# 定义损失函数和优化器
+criterion = nn.MSELoss()  # 使用均方误差（MSE）损失函数
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+# 训练模型
+
+# 存储每个 epoch 的指标
+all_epoch_loss = []  # 均方误差 MSE 即训练使用的损失函数
+all_epoch_r2 = []  # 决定系数r2
+all_epoch_mae = []  # 计算 MAE（平均绝对误差）
+all_epoch_rmse = []  # 计算 RMSE（均方根误差）
+
+# 存储每个 epoch 的指标
+all_test_epoch_loss = []
+all_test_epoch_r2 = []
+all_test_epoch_mae = []
+all_test_epoch_rmse = []
+
+for epoch in range(num_epochs):
+    model.train()  # 将模型设置成训练模式
+    running_loss = 0.0
+
+    # 用于计算指标
+    all_preds = []
+    all_labels = []
+
+    for inputs, labels in train_loader:
+        optimizer.zero_grad()
+
+        # 前向传播
+        outputs = model(inputs)
+
+        # 计算损失
+        loss = criterion(outputs, labels)
+        loss.backward()
+
+        # 更新参数
+        optimizer.step()
+
+        # running_loss += loss.item()
+        # 计算总损失
+        running_loss += loss.item() * inputs.size(0)
+
+        # 收集预测值和真实值
+        all_preds.append(outputs.detach().cpu().numpy())
+        all_labels.append(labels.detach().cpu().numpy())
+
+    # 计算每个 epoch 的平均损失
+    epoch_loss = running_loss / len(train_loader.dataset)  # !!!
+    print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {epoch_loss:.4f}")
+    all_epoch_loss.append(epoch_loss)
+
+    # 将预测值和真实值拼接在一起
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_labels = np.concatenate(all_labels, axis=0)
+
+    # 计算 R^2（决定系数）
+    ss_total = np.sum((all_labels - np.mean(all_labels)) ** 2)
+    ss_residual = np.sum((all_labels - all_preds) ** 2)
+    r2 = 1 - (ss_residual / ss_total)
+    all_epoch_r2.append(r2)
+    # 计算 MAE（平均绝对误差）
+    mae = np.mean(np.abs(all_labels - all_preds))
+    all_epoch_mae.append(mae)
+    # 计算 RMSE（均方根误差）
+    rmse = np.sqrt(np.mean((all_labels - all_preds) ** 2))
+    all_epoch_rmse.append(rmse)
+
+    ################
+    # 计算此时测试集的指标
+    ################
+    model.eval()  # 将模型设置为评估模式，禁用 dropout 等
+    all_test_preds = []
+    all_test_labels = []
+
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            outputs = model(inputs)
+
+            # 打印标签和预测值
+            # print(f"真实标签: {labels}, 预测标签: {outputs}")
+
+            # 将预测结果和真实标签收集到列表中
+            all_test_preds.append(outputs.detach().cpu().numpy())
+            all_test_labels.append(labels.detach().cpu().numpy())
+
+    # 将所有预测值和标签合并
+    all_test_preds = np.concatenate(all_test_preds, axis=0)
+    all_test_labels = np.concatenate(all_test_labels, axis=0)
+
+    # 计算 R² (决定系数)
+    test_ss_total = np.sum((all_test_labels - np.mean(all_test_labels)) ** 2)
+    test_ss_residual = np.sum((all_test_labels - all_test_preds) ** 2)
+    test_r2 = 1 - (test_ss_residual / test_ss_total)
+    # 计算 MAE (平均绝对误差)
+    test_mae = np.mean(np.abs(all_test_labels - all_test_preds))
+    # 计算 RMSE (均方根误差)
+    test_rmse = np.sqrt(np.mean((all_test_labels - all_test_preds) ** 2))
+    # 计算 MSE (均方误差)
+    test_mse = np.mean((all_test_labels - all_test_preds) ** 2)
+
+    all_test_epoch_loss.append(test_mse)
+    all_test_epoch_r2.append(test_r2)
+    all_test_epoch_mae.append(test_mae)
+    all_test_epoch_rmse.append(test_rmse)
+
+# 保存模型参数
+torch.save(model.state_dict(), './Att1.pth')
+
+# 训练集
+txt = "./Att1_train.txt"
+np.savetxt(txt, np.column_stack((all_epoch_loss, all_epoch_r2, all_epoch_mae, all_epoch_rmse)), fmt="%.8f",
+           comments='')
+# 测试集
+txt = "./Att1_test.txt"
+np.savetxt(txt, np.column_stack((all_test_epoch_loss, all_test_epoch_r2, all_test_epoch_mae, all_test_epoch_rmse)),
+           fmt="%.8f",
+           comments='')
+
+####################
+# 训练完成后模型的预测结果
+####################
+all_test_preds = []
+all_test_labels = []
+all_train_preds = []
+all_train_labels = []
+model.eval()  # 将模型设置为评估模式，禁用 dropout 等
+with torch.no_grad():
+    for inputs, labels in test_loader:
+        outputs = model(inputs)
+
+        # 打印标签和预测值
+        # print(f"真实标签: {labels}, 预测标签: {outputs}")
+
+        # 将预测结果和真实标签收集到列表中
+        all_test_preds.append(outputs.detach().cpu().numpy())
+        all_test_labels.append(labels.detach().cpu().numpy())
+
+    for inputs, labels in train_loader:
+        outputs = model(inputs)
+
+        # 打印标签和预测值
+        # print(f"真实标签: {labels}, 预测标签: {outputs}")
+
+        # 将预测结果和真实标签收集到列表中
+        all_train_preds.append(outputs.detach().cpu().numpy())
+        all_train_labels.append(labels.detach().cpu().numpy())
+
+# 将预测值和标签合并
+all_test_preds = np.concatenate(all_test_preds, axis=0)
+all_test_labels = np.concatenate(all_test_labels, axis=0)
+
+all_train_preds = np.concatenate(all_train_preds, axis=0)
+all_train_labels = np.concatenate(all_train_labels, axis=0)
+
+txt = "./Att1_test_prediction.txt"
+np.savetxt(txt, np.column_stack((all_test_preds, all_test_labels)),
+           fmt="%.8f", comments='')
+txt = "./Att1_train_prediction.txt"
+np.savetxt(txt, np.column_stack((all_train_preds, all_train_labels)),
+           fmt="%.8f", comments='')
+
+# 计算测试集上的指标
+test_mse = np.mean((all_test_labels - all_test_preds) ** 2)
+test_r2 = 1 - (np.sum((all_test_labels - all_test_preds) ** 2) / np.sum(
+    (all_test_labels - np.mean(all_test_labels)) ** 2))
+test_mae = np.mean(np.abs(all_test_labels - all_test_preds))
+test_rmse = np.sqrt(test_mse)
+test_avg_error = np.mean(np.abs(all_test_labels - all_test_preds))
+
+# 计算训练集上的指标
+train_mse = np.mean((all_train_labels - all_train_preds) ** 2)
+train_r2 = 1 - (np.sum((all_train_labels - all_train_preds) ** 2) / np.sum(
+    (all_train_labels - np.mean(all_train_labels)) ** 2))
+train_mae = np.mean(np.abs(all_train_labels - all_train_preds))
+train_rmse = np.sqrt(train_mse)
+train_avg_error = np.mean(np.abs(all_train_labels - all_train_preds))
+
+dd = [[train_mse, train_r2, train_mae, train_rmse, train_avg_error],
+      [test_mse, test_r2, test_mae, test_rmse, test_avg_error]]
+
+# 保存指标
+txt = "./Att1_model_test.txt"
+np.savetxt(txt, dd, fmt='%.6f', delimiter=',', header='MSE,R2,MAE,RMSE,Avg Error', comments='')
+
+plt.figure()
+plt.plot(all_epoch_loss, color='#BF1D2D', linewidth=1, label='epoch loss')
+plt.plot(all_test_epoch_loss, color='#262626', linewidth=1, label='test epoch loss')
+plt.title("MSE")
+plt.xlabel('epoch')
+plt.ylabel('MSE')
+plt.legend()
+
+plt.figure()
+plt.plot(all_epoch_r2, color='#BF1D2D', linewidth=1, label='epoch loss')
+plt.plot(all_test_epoch_r2, color='#262626', linewidth=1, label='test epoch loss')
+plt.title("R2")
+plt.xlabel('epoch')
+plt.ylabel('R2')
+plt.legend()
+plt.show()
